@@ -1,3 +1,141 @@
+# Manual runs only. Infrastructure is validated but never applied by this pipeline.
+trigger: none
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Set these as pipeline variables. Keep service connection authorization restricted
+  # to this pipeline and use workload identity federation where available.
+  azureServiceConnection: 'REPLACE_WITH_AZURE_SERVICE_CONNECTION'
+  resourceGroup: 'observability-rg-dev'
+  aksCluster: 'observability-aks'
+  acrName: 'observabilityacrwestusnodjs'
+  keyVaultName: 'keyvaultobservabilitydev'
+  # Client ID of the user-assigned identity allowed to read the Key Vault secret.
+  keyVaultIdentityClientId: 'REPLACE_WITH_CSI_USER_ASSIGNED_IDENTITY_CLIENT_ID'
+  imageTag: '$(Build.SourceVersion)'
+
+stages:
+  - stage: Validate
+    displayName: Validate source and infrastructure
+    jobs:
+      - job: Validate
+        steps:
+          - checkout: self
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: Use Node.js
+
+          - script: |
+              npm install --no-audit --no-fund
+              npm test
+            workingDirectory: 3-Tier-Application/Docker/frontend
+            displayName: Validate frontend
+
+          - task: GoTool@0
+            inputs:
+              version: '1.23.x'
+            displayName: Use Go 1.23
+
+          - script: go test ./...
+            workingDirectory: 3-Tier-Application/Docker/backend
+            displayName: Test backend
+
+          - script: |
+              terraform fmt -check -recursive
+              terraform init -backend=false -input=false
+              terraform validate
+            workingDirectory: .
+            displayName: Validate Terraform (no apply)
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.x'
+            displayName: Use Python for manifest validation
+
+          - script: |
+              python -m pip install --disable-pip-version-check PyYAML==6.0.2
+              python -c "import glob,yaml; files=glob.glob('3-Tier-Application/k8s/**/*.yaml', recursive=True); [list(yaml.safe_load_all(open(f, encoding='utf-8'))) for f in files]; print(f'Validated YAML syntax in {len(files)} Kubernetes manifests')"
+            displayName: Check Kubernetes manifest syntax
+
+  - stage: BuildAndPush
+    displayName: Build and push application images
+    dependsOn: Validate
+    jobs:
+      - job: BuildAndPush
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: Authenticate and push images to ACR
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                registry="${ACR_NAME}.azurecr.io"
+                az acr login --name "$ACR_NAME"
+                docker build --pull -t "$registry/goal-tracker-frontend:$IMAGE_TAG" 3-Tier-Application/Docker/frontend
+                docker build --pull -t "$registry/goal-tracker-backend:$IMAGE_TAG" 3-Tier-Application/Docker/backend
+                docker push "$registry/goal-tracker-frontend:$IMAGE_TAG"
+                docker push "$registry/goal-tracker-backend:$IMAGE_TAG"
+            env:
+              ACR_NAME: $(acrName)
+              IMAGE_TAG: $(imageTag)
+
+  - stage: Deploy
+    displayName: Deploy application to existing AKS
+    dependsOn: BuildAndPush
+    jobs:
+      - deployment: DeployApplication
+        environment: existing-aks
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: Apply app manifests and roll out images
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      if [[ "$CSI_IDENTITY_CLIENT_ID" == REPLACE_* || -z "$CSI_IDENTITY_CLIENT_ID" ]]; then
+                        echo "Set keyVaultIdentityClientId to the existing CSI user-assigned identity client ID."
+                        exit 2
+                      fi
+                      az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
+                      kubectl apply -f 3-Tier-Application/k8s/namespaces.yaml
+                      TENANT_ID="$(az account show --query tenantId --output tsv)"
+                      export KEYVAULT_NAME TENANT_ID CSI_IDENTITY_CLIENT_ID
+                      envsubst < 3-Tier-Application/k8s/backend/db-password-secret.yaml | kubectl apply -f -
+                      envsubst < 3-Tier-Application/k8s/database/db-password-secret.yaml | kubectl apply -f -
+                      kubectl apply -f 3-Tier-Application/k8s/backend/configmap.yaml
+                      kubectl apply -f 3-Tier-Application/k8s/backend/service.yaml
+                      kubectl apply -f 3-Tier-Application/k8s/frontend/configmap.yaml
+                      kubectl apply -f 3-Tier-Application/k8s/frontend/service.yaml
+                      registry="${ACR_NAME}.azurecr.io"
+                      kubectl apply -f 3-Tier-Application/k8s/backend/deployment.yaml
+                      kubectl apply -f 3-Tier-Application/k8s/frontend/deployment.yaml
+                      kubectl set image deployment/backend backend="$registry/goal-tracker-backend:$IMAGE_TAG" -n backend
+                      kubectl set image deployment/frontend frontend="$registry/goal-tracker-frontend:$IMAGE_TAG" -n frontend
+                      kubectl rollout status deployment/backend -n backend --timeout=180s
+                      kubectl rollout status deployment/frontend -n frontend --timeout=180s
+                      kubectl get services -n frontend
+                      kubectl get services -n backend
+                  env:
+                    RESOURCE_GROUP: $(resourceGroup)
+                    AKS_CLUSTER: $(aksCluster)
+                    ACR_NAME: $(acrName)
+                    IMAGE_TAG: $(imageTag)
+                    KEYVAULT_NAME: $(keyVaultName)
+                    CSI_IDENTITY_CLIENT_ID: $(keyVaultIdentityClientId)
 # Starter pipeline
 # Start with a minimal pipeline that you can customize to build and deploy your code.
 # Add steps that build, run tests, deploy, and more:
