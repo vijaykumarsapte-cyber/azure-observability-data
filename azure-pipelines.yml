@@ -1,4 +1,4 @@
-# Manual runs only. Infrastructure is validated but never applied by this pipeline.
+# Run from Azure DevOps only when manually queued.
 trigger: none
 pr: none
 
@@ -6,20 +6,20 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
-  # Set these as pipeline variables. Keep service connection authorization restricted
-  # to this pipeline and use workload identity federation where available.
-  azureServiceConnection: 'REPLACE_WITH_AZURE_SERVICE_CONNECTION'
+  # Replace azureServiceConnection with the exact ARM service connection name.
+  # Keep credentials in the service connection / secret variable group, not YAML.
+  azureServiceConnection: ''
   resourceGroup: 'observability-rg-dev'
   aksCluster: 'observability-aks'
   acrName: 'observabilityacrwestusnodjs'
   keyVaultName: 'keyvaultobservabilitydev'
-  # Client ID of the user-assigned identity allowed to read the Key Vault secret.
-  keyVaultIdentityClientId: 'REPLACE_WITH_CSI_USER_ASSIGNED_IDENTITY_CLIENT_ID'
+  # The existing AKS kubelet user-assigned identity client ID (Terraform output).
+  keyVaultIdentityClientId: ''
   imageTag: '$(Build.SourceVersion)'
 
 stages:
   - stage: Validate
-    displayName: Validate source and infrastructure
+    displayName: Validate application, Terraform, and Kubernetes manifests
     jobs:
       - job: Validate
         steps:
@@ -45,6 +45,11 @@ stages:
             workingDirectory: 3-Tier-Application/Docker/backend
             displayName: Test backend
 
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: '1.5.7'
+            displayName: Install Terraform
+
           - script: |
               terraform fmt -check -recursive
               terraform init -backend=false -input=false
@@ -63,7 +68,7 @@ stages:
             displayName: Check Kubernetes manifest syntax
 
   - stage: BuildAndPush
-    displayName: Build and push application images
+    displayName: Build and push frontend and backend to ACR
     dependsOn: Validate
     jobs:
       - job: BuildAndPush
@@ -79,16 +84,16 @@ stages:
                 set -euo pipefail
                 registry="${ACR_NAME}.azurecr.io"
                 az acr login --name "$ACR_NAME"
-                docker build --pull -t "$registry/goal-tracker-frontend:$IMAGE_TAG" 3-Tier-Application/Docker/frontend
-                docker build --pull -t "$registry/goal-tracker-backend:$IMAGE_TAG" 3-Tier-Application/Docker/backend
-                docker push "$registry/goal-tracker-frontend:$IMAGE_TAG"
-                docker push "$registry/goal-tracker-backend:$IMAGE_TAG"
+                docker build --pull -t "$registry/observability-frontend:$IMAGE_TAG" 3-Tier-Application/Docker/frontend
+                docker build --pull -t "$registry/observability-backend:$IMAGE_TAG" 3-Tier-Application/Docker/backend
+                docker push "$registry/observability-frontend:$IMAGE_TAG"
+                docker push "$registry/observability-backend:$IMAGE_TAG"
             env:
               ACR_NAME: $(acrName)
               IMAGE_TAG: $(imageTag)
 
   - stage: Deploy
-    displayName: Deploy application to existing AKS
+    displayName: Deploy frontend and backend to existing AKS
     dependsOn: BuildAndPush
     jobs:
       - deployment: DeployApplication
@@ -99,15 +104,15 @@ stages:
               steps:
                 - checkout: self
                 - task: AzureCLI@2
-                  displayName: Apply app manifests and roll out images
+                  displayName: Apply application manifests and roll out images
                   inputs:
                     azureSubscription: $(azureServiceConnection)
                     scriptType: bash
                     scriptLocation: inlineScript
                     inlineScript: |
                       set -euo pipefail
-                      if [[ "$CSI_IDENTITY_CLIENT_ID" == REPLACE_* || -z "$CSI_IDENTITY_CLIENT_ID" ]]; then
-                        echo "Set keyVaultIdentityClientId to the existing CSI user-assigned identity client ID."
+                      if [[ -z "$CSI_IDENTITY_CLIENT_ID" ]]; then
+                        echo "Set pipeline variable keyVaultIdentityClientId to the existing AKS kubelet identity client ID."
                         exit 2
                       fi
                       az aks get-credentials --resource-group "$RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
@@ -115,7 +120,6 @@ stages:
                       TENANT_ID="$(az account show --query tenantId --output tsv)"
                       export KEYVAULT_NAME TENANT_ID CSI_IDENTITY_CLIENT_ID
                       envsubst < 3-Tier-Application/k8s/backend/db-password-secret.yaml | kubectl apply -f -
-                      envsubst < 3-Tier-Application/k8s/database/db-password-secret.yaml | kubectl apply -f -
                       kubectl apply -f 3-Tier-Application/k8s/backend/configmap.yaml
                       kubectl apply -f 3-Tier-Application/k8s/backend/service.yaml
                       kubectl apply -f 3-Tier-Application/k8s/frontend/configmap.yaml
@@ -123,8 +127,8 @@ stages:
                       registry="${ACR_NAME}.azurecr.io"
                       kubectl apply -f 3-Tier-Application/k8s/backend/deployment.yaml
                       kubectl apply -f 3-Tier-Application/k8s/frontend/deployment.yaml
-                      kubectl set image deployment/backend backend="$registry/goal-tracker-backend:$IMAGE_TAG" -n backend
-                      kubectl set image deployment/frontend frontend="$registry/goal-tracker-frontend:$IMAGE_TAG" -n frontend
+                      kubectl set image deployment/backend backend="$registry/observability-backend:$IMAGE_TAG" -n backend
+                      kubectl set image deployment/frontend frontend="$registry/observability-frontend:$IMAGE_TAG" -n frontend
                       kubectl rollout status deployment/backend -n backend --timeout=180s
                       kubectl rollout status deployment/frontend -n frontend --timeout=180s
                       kubectl get services -n frontend
@@ -136,22 +140,3 @@ stages:
                     IMAGE_TAG: $(imageTag)
                     KEYVAULT_NAME: $(keyVaultName)
                     CSI_IDENTITY_CLIENT_ID: $(keyVaultIdentityClientId)
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
-trigger:
-- main
-
-pool:
-  vmImage: ubuntu-latest
-
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
-
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
