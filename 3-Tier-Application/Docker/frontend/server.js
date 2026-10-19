@@ -15,6 +15,9 @@ app.use(express.urlencoded({ extended: true }));
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Used by Kubernetes readiness/liveness probes without depending on the API.
+app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
+
 // API proxy routes to forward requests to the backend
 app.post('/api/goals', async (req, res) => {
   try {
